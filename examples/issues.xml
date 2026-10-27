@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<issues burpVersion="2026.7">
+  <issue>
+    <serialNumber>synthetic-issue-1</serialNumber>
+    <name>Potential invoice authorization weakness</name>
+    <host>https://portal.example.test</host><path>/api/invoices/1042</path>
+    <severity>High</severity><confidence>Tentative</confidence>
+    <issueDetail>SYNTHETIC DEMO. A scanner lead requires an ownership check and a second known account. Status codes alone do not establish access.</issueDetail>
+    <requestresponse>
+      <request base64="false"><![CDATA[GET /api/invoices/1042 HTTP/1.1
+Host: portal.example.test
+Authorization: Bearer synthetic-credential
+
+]]></request>
+      <response base64="false"><![CDATA[HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"invoice":1042,"owner":"customer-a"}]]></response>
+    </requestresponse>
+  </issue>
+</issues>

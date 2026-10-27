@@ -1,0 +1,3 @@
+{"kind":"terminal","source":"synthetic-replay","target":"portal.example.test","identity":"customer-a","content":"HTTP/2 200\ncontent-type: application/json","metadata":{"sequence":1}}
+{"kind":"note","source":"synthetic-replay","target":"portal.example.test","identity":"customer-a","content":"The practice portal has customer and administrator roles. Export permissions need review.","metadata":{"sequence":2}}
+{"kind":"http","source":"synthetic-replay","target":"https://portal.example.test/api/admin/export","identity":"administrator","content":"POST /api/admin/export → 202","metadata":{"method":"POST","url":"https://portal.example.test/api/admin/export","status":202,"response_body":"{\"job\":\"synthetic-job\"}","sequence":3}}

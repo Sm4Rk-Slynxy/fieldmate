@@ -1,0 +1,9 @@
+plugins { id 'java' }
+
+repositories { mavenCentral() }
+dependencies { compileOnly 'net.portswigger.burp.extensions:montoya-api:2026.7' }
+java { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+jar {
+    archiveFileName = 'fieldmate-burp.jar'
+    manifest { attributes('Main-Class': 'fieldmate.FieldmateExtension') }
+}

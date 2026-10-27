@@ -1,0 +1,221 @@
+/* End-to-end browser verification against disposable app and inference servers. */
+let playwright;
+try { playwright = require(process.env.FIELDMATE_PLAYWRIGHT_PATH || 'playwright'); }
+catch { throw new Error('Install Playwright locally or set FIELDMATE_PLAYWRIGHT_PATH to its module directory.'); }
+const { chromium } = playwright;
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const http = require('node:http');
+const {spawn} = require('node:child_process');
+const assert = require('node:assert/strict');
+
+(async () => {
+  const data = fs.mkdtempSync(path.join(os.tmpdir(),'fieldmate-browser-'));
+  const app = spawn('python3',['-m','fieldmate','--data',data,'serve','--port','0'], {cwd:path.resolve(__dirname,'..'),stdio:['ignore','pipe','pipe']});
+  let browser, page, model, appURL, token;
+  const errors = [];
+  const failedResponses = [];
+  const checks = [];
+  try {
+    appURL = await new Promise((resolve,reject) => {
+      let output=''; const timeout=setTimeout(() => reject(new Error('App start timed out')),10000);
+      app.stdout.on('data',bytes => { output+=bytes; const match=output.match(/Dashboard: (http:\/\/127\.0\.0\.1:\d+)/); if(match){clearTimeout(timeout);resolve(match[1]);} });
+      app.on('exit',code => {clearTimeout(timeout);reject(new Error('App exited '+code));});
+    });
+    token=fs.readFileSync(path.join(data,'token'),'utf8').trim();
+    const call=async (route,body) => {
+      const response=await fetch(appURL+'/api/'+route,{method:body===undefined?'GET':'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})});
+      assert.equal(response.ok,true,route+' failed'); return response.json();
+    };
+    browser=await chromium.launch({headless:true,...(process.env.FIELDMATE_CHROME ? {executablePath:process.env.FIELDMATE_CHROME} : fs.existsSync('/usr/bin/google-chrome') ? {executablePath:'/usr/bin/google-chrome'} : {}),args:['--no-sandbox']});
+    page=await browser.newPage({viewport:{width:1440,height:1050}});
+    page.on('pageerror',e=>errors.push(e.message));
+    page.on('console',message=>{if(message.type()==='error' && !message.text().includes('status of 400 (Bad Request)'))errors.push(message.text());});
+    page.on('response',response=>{if(response.status()>=400)failedResponses.push({status:response.status(),path:new URL(response.url()).pathname});});
+    await page.goto(appURL+'/#token='+encodeURIComponent(token));
+    await page.getByRole('heading',{name:/Your work/}).waitFor();
+    assert.equal(new URL(page.url()).hash,'');
+    checks.push('Authenticated launch removes token from URL');
+    await page.getByRole('button',{name:'Explore a practice lab'}).click();
+    await page.getByRole('heading',{name:/A little more/}).waitFor();
+    const eid=(await call('bootstrap')).engagements[0].id;
+    const snapshot=()=>call('engagements/'+eid);
+    assert.equal((await snapshot()).total_events,9);
+    await page.locator('.new-engagement').click();
+    await page.locator('#new-form [name="name"]').fill('Should not be created');
+    await page.locator('#new-form [name="scope"]').fill('cancel.example.test');
+    await page.getByRole('button',{name:'Cancel',exact:true}).click();
+    assert.equal((await call('bootstrap')).engagements.length,1);
+    checks.push('Canceling a valid form does not submit or mutate data');
+    await page.waitForFunction(()=>!document.querySelector('#toast').classList.contains('show'));
+    await page.waitForFunction(()=>getComputedStyle(document.querySelector('#toast')).opacity==='0');
+    await page.screenshot({path:path.resolve(__dirname,'../preview.png')});
+    checks.push('Practice lab and evidence-grounded dashboard render');
+    await page.locator('[data-view="evidence"]').first().click();
+    await page.getByRole('heading',{name:/Every observation/}).waitFor();
+    await page.locator('#evidence-search').fill('/api/admin/export');
+    assert.equal(await page.locator('tbody tr').count(),1);
+    await page.locator('tbody [data-action="evidence-detail"]').first().click();
+    await page.getByRole('heading',{name:'Evidence detail'}).waitFor();
+    const evidenceID=await page.getByLabel('Evidence ID',{exact:true}).inputValue();
+    assert.match(evidenceID,/^[a-f0-9-]{36}$/);
+    await page.getByRole('button',{name:'Close dialog'}).click();
+    checks.push('Evidence search and detail links work');
+    await page.locator('[data-view="coverage"]').first().click();
+    await page.getByRole('button',{name:'Record result'}).first().click();
+    await page.locator('#test-form [name="notes"]').fill('Verified the expected behavior in this browser test.');
+    await page.getByRole('button',{name:'Save result'}).click();
+    await page.waitForFunction(()=>!document.querySelector('dialog').open);
+    assert((await snapshot()).coverage.some(t=>t.notes.includes('browser test')));
+    checks.push('Coverage result persists and resolves matching suggestions');
+    await page.locator('[data-view="findings"]').first().click();
+    await page.getByRole('button',{name:'New finding',exact:true}).click();
+    await page.locator('#finding-form [name="title"]').fill('Browser test: manually validated finding');
+    await page.locator('#finding-form [name="status"]').selectOption('confirmed');
+    await page.getByRole('button',{name:'Save finding'}).click();
+    await page.locator('.dialog-error').waitFor();
+    assert.match(await page.locator('.dialog-error').innerText(),/Confirmed findings need/);
+    await page.locator('#finding-form [name="reproduction"]').fill('Synthetic reproduction steps.');
+    await page.locator('#finding-form [name="impact"]').fill('Synthetic demonstrated impact.');
+    await page.locator('#finding-form [name="evidence"]').fill(evidenceID);
+    await page.getByRole('button',{name:'Save finding'}).click();
+    await page.waitForFunction(()=>!document.querySelector('dialog').open);
+    const downloadPromise=page.waitForEvent('download');
+    await page.getByRole('button',{name:'Export report'}).click();
+    const download=await downloadPromise;
+    assert.equal(download.suggestedFilename(),'fieldmate-report.md');
+    checks.push('Finding confirmation validation and Markdown export work');
+    await page.locator('[data-view="overview"]').first().click();
+    await page.getByRole('button',{name:'Add a field note'}).click();
+    await page.locator('#note-form [name="content"]').fill('<img src=x onerror="window.XSS=true"> business rule');
+    await page.locator('#note-form [name="target"]').fill('portal.example.test');
+    await page.getByRole('button',{name:'Save note'}).click();
+    await page.waitForFunction(()=>!document.querySelector('dialog').open);
+    assert.equal(await page.evaluate(()=>window.XSS),undefined);
+    checks.push('Untrusted evidence renders as escaped text');
+    await page.getByRole('button',{name:'Import evidence',exact:true}).first().click();
+    await page.locator('#import-file').setInputFiles(path.resolve(__dirname,'../examples/network.xml'));
+    await page.locator('#import-form button[type="submit"]').click();
+    await page.waitForFunction(()=>!document.querySelector('dialog').open);
+    checks.push('File import works through the browser');
+    let modelCalls=0;
+    model=http.createServer((req,res)=>{
+      let body='';req.on('data',chunk=>body+=chunk);req.on('end',()=>{
+        res.setHeader('Content-Type','application/json');
+        if(req.url==='/v1/models'){res.end(JSON.stringify({data:[{id:'synthetic-test-model',loaded:true}]}));return;}
+        assert.equal(req.url,'/v1/chat/completions');
+        const payload=JSON.parse(body);
+        assert.equal(req.headers.authorization,'Bearer synthetic-test-key');
+        assert.equal(payload.stream,false);assert.equal(payload.enable_tools,false);assert.equal(payload.tool_choice,'none');
+        assert.deepEqual(payload.enabled_tools,[]);
+        const context=JSON.parse(payload.messages[1].content);
+        const event=context.evidence.find(e=>e.kind==='http');
+        if(payload.messages[0].content.includes('skeptical reviewer')){
+          modelCalls++;
+          const item={title:'Synthetic project: check invoice ownership',assessment:'needs_validation',explanation:'A scanner lead exists, but account ownership and a second known identity still need verification.',evidence:[event.id],counter_evidence:[],false_positive_checks:['Compare two known account owners; a 403 alone is not conclusive.'],manual_tests:[{title:'Compare a second account',purpose:'Change only the credential and compare the body.',expected:'An unrelated owner’s object supports the hypothesis. A consistent denial refutes only this tested combination.',evidence_id:event.id,changes:{headers:{Authorization:'Bearer <OTHER_ACCOUNT_TOKEN>'}}}]};
+          res.end(JSON.stringify({choices:[{message:{content:JSON.stringify({assessments:[item]})}}]}));return;
+        }
+        const suggestion={title:'Synthetic model: verify export access',kind:'hypothesis',priority:'medium',observation:'The export operation was observed.',next_step:'Compare expected access with the relevant roles.',rationale:'Captured traffic alone is insufficient to establish access controls.',subject:event.target,check_name:'synthetic-model-check',evidence:[event.id]};
+        modelCalls++;
+        res.end(JSON.stringify({choices:[{message:{content:JSON.stringify({suggestions:[suggestion]})}}]}));
+      });
+    });
+    await new Promise(resolve=>model.listen(0,'127.0.0.1',resolve));
+    await page.locator('[data-view="settings"]').first().click();
+    await page.locator('[name="base_url"]').fill('http://127.0.0.1:'+model.address().port);
+    await page.locator('[name="api_key"]').fill('synthetic-test-key');
+    await page.getByRole('button',{name:'Test & discover models'}).click();
+    await page.locator('.connection-result').waitFor();
+    assert.match(await page.locator('.connection-result').innerText(),/Connected/);
+    assert.equal(await page.locator('[name="model"]').inputValue(),'synthetic-test-model');
+    await page.getByRole('button',{name:'Save connection',exact:true}).click();
+    assert.equal((await call('bootstrap')).settings.model,'synthetic-test-model');
+    await page.locator('[data-view="overview"]').first().click();
+    await page.getByRole('button',{name:'Review evidence',exact:true}).click();
+    await page.getByRole('heading',{name:'Synthetic model: verify export access'}).waitFor({timeout:15000});
+    assert.equal(modelCalls,1);
+    checks.push('Unsloth-compatible discovery, auth, and grounded inference round trip');
+    await page.locator('[data-view="projects"]').first().click();
+    await page.getByRole('button',{name:'Upload .burp project',exact:true}).first().click();
+    await page.locator('#project-file').setInputFiles({name:'synthetic-project.burp',mimeType:'application/octet-stream',buffer:Buffer.from('synthetic archive, not parsed or executed\0')});
+    await page.getByRole('button',{name:'Upload project archive',exact:true}).click();
+    await page.getByRole('heading',{name:'Import saved project evidence'}).waitFor();
+    const projectId=await page.getByLabel('Project import ID',{exact:true}).inputValue();
+    assert.equal((await snapshot()).projects[0].status,'awaiting_data');
+    assert.equal(modelCalls,1);
+    await page.evaluate(()=>{
+      window.savedArchive=[];
+      window.showSaveFilePicker=async()=>({createWritable:async()=>new WritableStream({write(chunk){window.savedArchive.push(...chunk);}})});
+    });
+    await page.getByRole('button',{name:'Download stored copy'}).click();
+    await page.waitForFunction(()=>window.savedArchive?.length>0);
+    assert.equal(Buffer.from(await page.evaluate(()=>window.savedArchive)).toString(),'synthetic archive, not parsed or executed\0');
+    checks.push('Stored archive streams to a selected file without buffering a Blob');
+    await page.getByRole('button',{name:'Attach a readable export'}).click();
+    await page.locator('#project-export-file').setInputFiles(path.resolve(__dirname,'../examples/issues.xml'));
+    await page.locator('#project-export-form [name="identity"]').fill('customer-a');
+    await page.getByRole('button',{name:'Import saved evidence',exact:true}).click();
+    await page.waitForFunction(()=>!document.querySelector('dialog').open);
+    assert.equal((await snapshot()).projects[0].status,'ready');
+    await page.getByRole('button',{name:'Review project',exact:true}).click();
+    await page.getByRole('heading',{name:'Synthetic project: check invoice ownership'}).waitFor({timeout:15000});
+    assert.equal((await snapshot()).assessments[0].disposition,'open');
+    await page.getByRole('button',{name:/Repeater request text \(1\)/}).first().click();
+    await page.getByRole('heading',{name:'Burp Repeater · manual request text'}).waitFor();
+    const manualRequest=await page.getByLabel('Repeater request text',{exact:true}).inputValue();
+    assert.match(manualRequest,/Host: portal\.example\.test/);
+    assert.match(manualRequest,/<OTHER_ACCOUNT_TOKEN>/);
+    assert.equal(await page.getByRole('button',{name:/^(Send|Execute|Run request)$/i}).count(),0);
+    const manualDownload=page.waitForEvent('download');
+    await page.getByRole('button',{name:'Download .txt'}).click();
+    assert.equal((await manualDownload).suggestedFilename(),'repeater-request.txt');
+    await page.getByRole('button',{name:'Close dialog'}).click();
+    await page.getByRole('button',{name:'Record my decision'}).first().click();
+    await page.locator('#review-decision-form [name="disposition"]').selectOption('needs_more_evidence');
+    await page.getByRole('button',{name:'Record decision',exact:true}).click();
+    await page.waitForFunction(()=>!document.querySelector('dialog').open);
+    assert.equal((await snapshot()).assessments[0].disposition,'needs_more_evidence');
+    assert.equal((await snapshot()).findings[0].status,'confirmed');
+    assert.equal((await snapshot()).projects[0].id,projectId);
+    checks.push('Native archive staging, issue export review, skeptical assessment, and manual-only Repeater download');
+    await page.screenshot({path:path.resolve(__dirname,'../preview-project-review.png'),fullPage:true});
+    await page.evaluate(()=>{
+      const original=state.snapshot.assessments[0];
+      state.snapshot.assessments=Array.from({length:25},(_,i)=>({...original,id:'synthetic-'+i,title:'Synthetic assessment '+i}));
+      state.reviewLimit=20;render();
+    });
+    assert.equal(await page.locator('article.suggestion').count(),20);
+    await page.getByRole('button',{name:'Show more assessments'}).click();
+    assert.equal(await page.locator('article.suggestion').count(),25);
+    assert.equal(await page.getByRole('button',{name:'Show more assessments'}).count(),0);
+    checks.push('Project review exposes retained assessments beyond the first 20');
+    await page.locator('[data-view="overview"]').first().click();
+    // Simulate the browser-selected media source without capturing the user's desktop.
+    await page.evaluate(()=>{
+      navigator.mediaDevices.getDisplayMedia=async()=>{
+        const canvas=document.createElement('canvas');canvas.width=800;canvas.height=450;
+        const ctx=canvas.getContext('2d');ctx.fillStyle='#245946';ctx.fillRect(0,0,800,450);ctx.fillStyle='white';ctx.font='28px sans-serif';ctx.fillText('Synthetic capture source',40,100);
+        return canvas.captureStream(1);
+      };
+    });
+    await page.getByRole('button',{name:'Watch screen'}).click();
+    await page.locator('#capture-form [name="target"]').fill('portal.example.test');
+    await page.getByRole('button',{name:'Choose window & start'}).click();
+    await page.getByRole('button',{name:'Stop watching'}).waitFor();
+    for(let i=0;i<30;i++){if((await snapshot()).counts.screenshot)break;await new Promise(resolve=>setTimeout(resolve,100));}
+    assert.equal((await snapshot()).counts.screenshot,1);
+    await page.getByRole('button',{name:'Stop watching'}).click();
+    checks.push('Selected-media capture pipeline stores a frame and stops cleanly');
+    await page.setViewportSize({width:390,height:844});
+    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth));
+    await page.screenshot({path:path.resolve(__dirname,'../preview-mobile.png'),fullPage:true});
+    checks.push('Mobile layout has no horizontal overflow');
+    assert.deepEqual(errors,[]);
+    assert.deepEqual(failedResponses,[{status:400,path:`/api/engagements/${eid}/findings`}]);
+    console.log(JSON.stringify({passed:checks,consoleErrors:errors},null,2));
+  } finally {
+    if(browser)await browser.close();if(model)await new Promise(resolve=>model.close(resolve));app.kill('SIGTERM');
+    await new Promise(resolve=>app.once('exit',resolve));fs.rmSync(data,{recursive:true,force:true});
+  }
+})().catch(error=>{console.error(error);process.exitCode=1;});
